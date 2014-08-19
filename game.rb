@@ -5,6 +5,8 @@ Bundler.require(:default, APP_ENV)
 
 require 'json'
 
+ANSI_COLORS = [:red, :yellow, :green, :cyan, :magenta, :blue] # I'm goy
+
 module Groupme
   extend self
 
@@ -13,7 +15,10 @@ module Groupme
   BOT_ID = ENV['GROUPME_BOT_ID'] || (raise 'GROUPME_BOT_ID must be set')
 
   def post_message(text)
-    return false if APP_ENV == :development
+    if APP_ENV == :development
+      puts text.ansi(ANSI_COLORS.shuffle.first)
+      return false
+    end
 
     url = "https://api.groupme.com/v3/bots/post?token=#{ACCESS_TOKEN}"
     body = {
@@ -29,18 +34,22 @@ module StringCleaner
   extend self
 
   def clean(string)
-    str = Sanitize.fragment(string)
+    str = string.dup
+    str.gsub!(/ (and|&) /, ' ')
+    str = Sanitize.fragment(str)
     str = str.downcase.gsub(/[^\w ]/, '')[/^(?:(?:the|an?) )? *([a-z \.]+)/i][$1]
-    str.gsub('-', ' ')
-    str.gsub(/s$/, '')
+    str.gsub!('-', ' ')
+    str.gsub!(/s$/, '') # de-pluralize
+    str.squeeze(' ').strip
   end
 
 end
 
 class Trivia
 
-  URL = 'http://jservice.io/api/random?count=1'
   SECS_TO_ANSWER = 30
+  QUESTION_FILE = File.expand_path('../questions.json', __FILE__)
+  QUESTIONS = JSON.parse(File.read(QUESTION_FILE)) # this will use nearly 1mb of RAM
 
   attr_reader :current_question
 
@@ -52,16 +61,16 @@ class Trivia
   def ask_question
     set_question generate_question.merge('asked_at' => Time.now)
 
-    question_msg = "[Q] #{@current_question['question']}\n(#{SECS_TO_ANSWER}s to answer)"
+    question_msg = "[Q] #{@current_question['Q']}\n(#{SECS_TO_ANSWER}s to answer)"
 
     Groupme.post_message(question_msg)
   end
 
   def try_answer(user_id, username, answer_attempt)
-    answer_token = StringCleaner.clean(@current_question['answer'])
+    answer_token = StringCleaner.clean(@current_question['A'])
     answer_attempt_token = StringCleaner.clean(answer_attempt)
 
-    if (Time.now - Time.parse(@current_question['asked_at'].to_s)) > SECS_TO_ANSWER
+    if seconds_remaining.zero?
       post_timer_ran_out(answer_token)
       set_question(nil)
     elsif answer_token == answer_attempt_token
@@ -78,8 +87,8 @@ class Trivia
 
   def active_question?
     if @current_question
-      if (Time.now - Time.parse(@current_question['asked_at'].to_s)) > SECS_TO_ANSWER
-        post_timer_ran_out(@current_question['answer'])
+      if seconds_remaining.zero?
+        post_timer_ran_out(@current_question['A'])
         @current_question = nil
         false
       else
@@ -90,6 +99,11 @@ class Trivia
     end
   end
 
+  def seconds_remaining
+    secs = SECS_TO_ANSWER - (Time.now - Time.parse(@current_question['asked_at'].to_s))
+    [secs.ceil, 0].max
+  end
+
   private
 
   def post_timer_ran_out(answer)
@@ -97,24 +111,15 @@ class Trivia
   end
 
   def post_answer_correct(user_id, username, answer)
-    Groupme.post_message("[A: #{username} (#{@points.points_for(user_id)}p)] Yes, #{@current_question['answer']}")
+    Groupme.post_message("[A: #{username} (#{@points.points_for(user_id)}p)] Yes, #{@current_question['A']}")
   end
 
   def post_answer_incorrect(user_id, username, answer)
-    Groupme.post_message("[A: #{username} (#{@points.points_for(user_id)}p)] Nope, \"#{answer}\" is wrong")
+    Groupme.post_message("[A: #{username} (#{@points.points_for(user_id)}p)] Nope, \"#{answer}\" is wrong. #{seconds_remaining}s left to answer...")
   end
 
   def generate_question
-    q = nil
-    loop do
-      resp = Typhoeus.get(URL)
-      q = JSON.parse(resp.body)[0]
-
-      if q['question'] && !q['question'].empty?
-        break
-      end
-    end
-    q
+    QUESTIONS.shuffle.shift # shifting will remove the question from the questions array
   end
 
   def set_question(question)
@@ -181,11 +186,23 @@ post '/submit_message' do
   if !settings.trivia.active_question? && text =~ /^[\\\/]trivia *$/i
     settings.trivia.ask_question
 
-  elsif settings.trivia.active_question? && text =~ /^[\\\/](?:a|answer) +(.+) *$/i
-    username = message['name']
-    user_id = message['user_id']
+    # NOTE this is insane... keeping thread open for timer
+    # while settings.trivia.active_question?
+    #   puts "#{settings.trivia.seconds_remaining}s remaining to answer"
+    #   sleep 1
+    # end
 
-    settings.trivia.try_answer(user_id, username, $1)
+  elsif settings.trivia.active_question?
+
+    if text =~ /^[\\\/](?:a|answer) +(.+) *$/i # answering
+      username = message['name']
+      user_id = message['user_id']
+
+      settings.trivia.try_answer(user_id, username, $1)
+    else
+      puts 'Question still active'.ansi(:red)
+    end
+
   else
     puts "nothing".ansi(:red)
   end
